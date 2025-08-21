@@ -1,0 +1,155 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from typing import List
+import time
+
+# V2 : 实现Positional Encoding
+# 新加一层：让我们的神经网络在训练的时候，不仅考虑到token本身，还考虑了token所在的位置
+torch.manual_seed(42)
+
+prompts = ["春江", "往事"]  # 推理的输入prompts
+max_new_token = 100  # 推理生成的最大tokens数量
+
+max_iters = 5000  # 训练的最大迭代次数
+eval_iters = 100  # 评估的迭代次数
+eval_interval = 200  # 评估的间隔
+batch_size = 32  # 每个批次的大小
+block_size = 8  # 每个序列的最大长度
+learning_rate = 1e-2  # 学习率 , 科学计数法 表示 0.01
+n_embed = 32  # 嵌入层的维度
+tain_data_ratio = 0.9  # 训练数据占数据集的比例，剩下的是验证数据
+
+device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
+
+with open('demo01_firstBuildLlm/data/ci.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
+
+
+class Tokenizer:
+    def __init__(self, text: str):
+        self.chars = sorted(list(set(text)))
+        self.vocab_size = len(self.chars)
+        self.stoi = {ch: i for i, ch in enumerate(self.chars)}
+        self.itos = {i: ch for i, ch in enumerate(self.chars)}
+
+    def encode(self, s: str) -> List[int]:
+        return [self.stoi[c] for c in s]
+
+    def decode(self, l: List[int]) -> str:
+        return ''.join([self.itos[i] for i in l])
+
+
+# BabyGPT 类继承 nn.Module，包含嵌入层（将字符映射到高维空间）和线性头（映射回词汇空间）。forward 方法计算 logits 和损失；generate 方法基于 softmax 和多项采样生成新序列
+# 嵌入层学习字符表示，线性头预测下一个字符
+class BabyGPT(nn.Module):
+    def __init__(self, vocab_size: int, block_size: int, n_embd: int):
+        super().__init__()
+        self.block_size = block_size
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # 嵌入层，把token映射到n_embd维空间
+        self.postion_embedding_table = nn.Embedding(block_size, n_embed) # 建设一个“位置”映射关系
+        self.lm_head = nn.Linear(n_embd, vocab_size) # 线性层，把n_embd维空间映射到vocab_size维空间，
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape # B是batch size，T是block size
+        T = min(T, self.block_size)
+        idx = idx[:, -T:] # 不管输入的序列有多长，我们只取最后的block_size个token
+        tok_emb = self.token_embedding_table(idx) # 获得token的嵌入表示 (B,T,n_embd)
+        pos_emb = self.postion_embedding_table(torch.arange(T, device=idx.device)) # 获得位置的嵌入表示 (T,n_embd)
+        x = tok_emb + pos_emb # 给token的嵌入表示加上位置的嵌入表示，x有了“位置”信息！
+        logits = self.lm_head(x) # 通过线性层，把embedding结果重新映射回vocab_size维空间 (B,T,vocab_size)
+
+        if targets is None: # 推理场景，不需要计算损失值
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C) # 把(B,T,C)的形状转换为(B*T,C)，因为交叉熵损失函数第一个参数只接受二维输入。这个操作并没有丢失信息
+            targets = targets.view(B*T) # 把(B,T)的形状转换为(B*T)，因为交叉熵损失函数第二个参数只接受一维输入。这个操作并没有丢失信息
+            loss = F.cross_entropy(logits, targets) # 计算交叉熵损失
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            logits, _ = self(idx) # logits的形状是(B,T,vocab_size)，每一个token都计算了下一个token的概率
+            logits = logits[:, -1, :] # 实际上我们只需要最后一个token算出来的值
+            probs = F.softmax(logits, dim=-1) # 使用softmax函数算概率分布，这里dim=-1表示对最后一个维度进行softmax
+            idx_next = torch.multinomial(probs, num_samples=1) # 根据概率分布随机采样，这里num_samples=1表示采样一个token
+            idx = torch.cat((idx, idx_next), dim=1) # 把采样的token拼接到序列后面
+        return idx
+
+
+tokenizer = Tokenizer(text)
+vocab_size = tokenizer.vocab_size
+
+# 创建长整数张量（适合索引）
+raw_data = torch.tensor(tokenizer.encode(text), dtype=torch.long).to(device)
+n = int(tain_data_ratio * len(raw_data))  # 分割训练/验证集
+data = {'train': raw_data[:n], 'val': raw_data[n:]}
+
+
+# 随机采样批次序列 x 和目标 y（y 是 x 的移位版本）
+def get_batch(data, batch_size, block_size):
+    # 从 [0, high) 均匀采样整数。size=(batch_size,) 生成一维张量
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    # 沿新维度堆叠张量列表，形状 (batch_size, block_size)
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+    x, y = x.to(device), y.to(device)
+    return x, y
+
+
+# 评估模型损失，平均 eval_iters 次采样，避免单次波动
+@torch.no_grad()  # 装饰器，禁用梯度计算，节省内存
+def estimate_loss(model, data, batch_size, block_size, eval_iters):
+    '''
+    计算模型在训练集和验证集上的损失
+    '''
+    out = {}
+    model.eval()  # 切换到评估模式  eval 禁用 dropout 等
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)  # 创建全零张量
+        for k in range(eval_iters):
+            x, y = get_batch(data[split], batch_size, block_size)
+            _, loss = model(x, y)
+            losses[k] = loss.item()  # 从标量张量提取 Python 浮点数
+        out[split] = losses.mean()  # 计算平均值
+    model.train()  # 切换回训练模式
+    return out
+
+
+model = BabyGPT(vocab_size, block_size, n_embed).to(device)
+
+# 训练
+# model.parameters()：返回模型所有可学习参数的迭代器
+# torch.optim.AdamW(params, lr)：AdamW 优化器（Adam + 权重衰减）。params 是参数列表，lr 是学习率
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+start_time = time.time()
+tokens_processed = 0
+
+for iter in range(max_iters):
+    x, y = get_batch(data['train'], batch_size, block_size)
+    logits, loss = model(x, y)
+    optimizer.zero_grad(set_to_none=True)  # 清零梯度（set_to_none 优化内存）
+    loss.backward()  # 反向传播，计算梯度
+    optimizer.step()  # 根据梯度更新参数（AdamW 规则）
+
+    tokens_processed += batch_size * block_size
+
+    if iter % eval_interval == 0:
+        elapsed = time.time() - start_time
+        tokens_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
+        losses = estimate_loss(model, data, batch_size, block_size, eval_iters)
+        print(
+            f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, speed: {tokens_per_sec:.2f} tokens/sec")
+
+# 推理
+prompt_tokens = torch.stack([torch.tensor(tokenizer.encode(p)).to(device) for p in prompts])
+
+# 生成
+result = model.generate(prompt_tokens, max_new_token)
+
+# 解码并打印结果
+for tokens in result:
+    print(tokenizer.decode(tokens.tolist()))
+    print('-' * 10)
